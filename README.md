@@ -391,3 +391,375 @@ and then flip bits in the output histogram with probability $p$ — that is
    nm.add_all_qubit_quantum_error(
        pauli_error([("X", p), ("I", 1 - p)]), ["id"]
    )
+   ```
+
+2. Inserts `qc.id(qb)` on every data qubit right after the encoded state
+   is prepared. The simulator's **density-matrix / stabilizer propagation**
+   then samples each `id` gate and applies the Pauli error *inside* the
+   state, before the syndrome measurement.
+
+Consequences:
+
+- The syndrome measurement **sees** the error because the error is
+  genuinely present in the quantum state.
+- Multi-qubit errors arise from **independent** single-qubit errors on
+  different `id` gates — exactly the physical scenario that QEC must
+  overcome.
+- Corrections are applied based on the **measured** syndrome, not on the
+  injected error — the two agree for a single error, but disagree whenever
+  ≥ 2 physical qubits flip, which is the failure mode QEC must handle.
+
+### 4.1 Simulator backend
+
+`run_circuit()` tries backends in this order:
+
+1. **`stabilizer`** — Clifford circuits (all gates used here are Clifford)
+   with Pauli noise. It scales to the 17-qubit Shor circuit (9 data + 6 `x`-
+   ancilla + 2 `z`-ancilla) and runs 2000 shots in well under a second.
+2. **`automatic`** — fallback that picks the best method per circuit.
+
+---
+
+## 5. How to Use the App
+
+### Sidebar
+
+| Control | Effect |
+|---------|--------|
+| **Demonstration** | Select ideal baseline, 3-qubit codes, or Shor code. |
+| **Physical error probability (%)** | Sets $p$ for the statistical run only; the deterministic walkthrough uses a fixed single injected error. |
+| **Shots per statistical test** | Samples per statistical experiment (100 – 5000). |
+| **Qubit receiving the walkthrough error** | The qubit $q_i$ on which the walkthrough injects the error. |
+| **Shor-code noise channel** | $X$, $Z$, $Y$, or general for the Shor demo. |
+| **Run simulation** | Executes the demo. |
+| **Reset** | Returns to the overview screen. |
+
+### Results screen
+
+Every demonstration shows:
+
+1. **Before-correction circuit diagram** — the encoded state, the injected
+   error (red), the syndrome measurement, and dashed "possible error" boxes
+   on all other qubits.
+2. **Measured syndrome** — the numeric $(s_0, s_1)$ pair (or six bits for
+   Shor) plus its interpretation.
+3. **After-correction circuit diagram** — the fired correction is drawn in
+   **green**; non-fired corrections remain dashed.
+4. **Deterministic comparison table** — same injected error, without vs.
+   with correction, in both the $0/1$ and $+/-$ bases.
+5. **Statistical table** — raw error rate (one unprotected qubit) versus
+   post-QEC error rate (encoded + corrected), for each basis. Green rows
+   mean QEC helped; amber rows mean QEC made things worse (past break-even).
+
+---
+
+## 6. Technical Architecture (Code)
+
+### 6.1 File layout
+
+```
+qec_app.py
+│
+├── Configuration
+│   ├── IDEAL_SHOTS, STAT_SHOTS, CHECK_SHOTS
+│   └── SYNDROME_TO_INDEX, ERROR_TITLES, PREP_LABELS
+│
+├── Noise models (4 factories)
+│   └── create_{x,z,y,general}_noise_model → pauli_error
+│
+├── Circuit execution
+│   ├── run_circuit(qc, shots, noise_model)       # stabilizer → automatic
+│   ├── parse_key(qc, key)                        # split counts into regs
+│   ├── extract_syndrome(qc)                      # most-frequent syndrome
+│   └── out_strings(qc, counts)                   # just the "out" register
+│
+├── Textbook diagram renderer
+│   ├── _layout_circuit(qc)                       # column & section layout
+│   ├── draw_textbook_circuit(qc, title, ...)     # matplotlib figure
+│   └── _footnote(code, pauli)                    # per-code footer text
+│
+├── Building blocks
+│   ├── prepare_logical / measure_logical
+│   ├── _marker_gate / apply_fix                  # coloured error & fix gates
+│   └── insert_error(qc, data, inject, noisy)     # ERROR or id gates
+│
+├── Code builders
+│   ├── 3-qubit: encode / syndrome / correct / decode
+│   │            build_three_qubit_circuit(...)
+│   └── Shor  : encode / sx-syndrome / sz-syndrome / decode / identify
+│                build_shor_circuit(...)
+│
+├── Statistics
+│   └── run_statistics(code, error_type, p, tests, shots)
+│
+└── Streamlit UI
+    ├── sidebar (inputs, run/reset buttons)
+    ├── show_circuit(qc, title, ...)
+    ├── show_statistics(res, title)
+    ├── walkthrough_comparison_table(...)
+    └── dispatch on demo name
+```
+
+### 6.2 Circuit builder contract
+
+Both `build_three_qubit_circuit()` and `build_shor_circuit()` accept the same
+keyword arguments, so the UI can dispatch uniformly:
+
+```python
+build_three_qubit_circuit(
+    code       = "bitflip" | "phaseflip",
+    basis      = "Z" | "X",                   # logical state |1> or |->
+    inject     = {qubit_index: "X"|"Y"|"Z"},  # walkthrough error (visible)
+    noisy      = True | False,                # statistical noise via id gates
+    stage      = "syndrome" | "full",
+    correction = "dynamic" | "fixed" | "none",
+    fixed      = qubit_index | None,          # required if correction="fixed"
+)
+```
+
+`stage="syndrome"` stops the circuit right after the ancilla measurements,
+which is what the *before-correction* diagrams show. `stage="full"` continues
+through decode and data measurement.
+
+`correction="dynamic"` uses `qc.if_test((syn, value))` — a real
+classically-controlled correction driven by the measured syndrome. This is
+what the statistical simulation uses. `correction="fixed"` applies an
+explicit `X`/`Z` marker gate to a qubit chosen by the user — this is what
+the walkthrough uses so the fired correction can be drawn in green.
+
+### 6.3 Error injection
+
+`insert_error(qc, data, inject=None, noisy=False)` places:
+
+- **A visible `X/Y/Z error` gate** on each qubit in `inject` (walkthrough).
+- **An `id` gate** on every data qubit when `noisy=True` (statistics). The
+  `NoiseModel` attaches the Pauli channel to those `id` gates, so the error
+  occurs *inside* the simulation.
+
+Every error/fix gate is defined by `_marker_gate(pauli, kind)` — a small
+named sub-circuit — so the diagram renderer can detect it by name
+(`"xerror"`, `"zfix"`, etc.) and colour it appropriately.
+
+### 6.4 Diagram renderer
+
+`draw_textbook_circuit()` reconstructs a hand-drawn-style figure from the
+actual `QuantumCircuit` object:
+
+1. `_layout_circuit()` walks `qc.data`, assigns every instruction a column,
+   and starts a new **section** at every labelled barrier (`PREPARE`,
+   `ENCODE`, `ERROR`, `SYNDROME`, `CORRECT`, `DECODE`, `MEASURE`).
+2. Sections are merged into **groups** (`ENCODE`, `DECODE`, `ERROR`,
+   `CORRECT`, `MEASURE`) and enclosed in dashed ovals (or rounded boxes
+   for tall sections like Shor's 9-qubit block).
+3. Vertical dashed lines with $|\psi_k\rangle$ markers are drawn at every
+   section boundary after `ENCODE`, giving the reader the state evolution.
+4. `if_else` operations render as classically-controlled boxes connected to
+   the measurement symbol by a classical wire; **the branch whose value
+   matches `highlight` is coloured green** — this is how the diagram shows
+   *which* correction fired for the specific error the user injected.
+
+### 6.5 Statistics engine
+
+`run_statistics()` runs, for each test:
+
+1. **Unprotected baseline.** A one-qubit circuit through the same noisy `id`
+   gate → raw error rate.
+2. **Encoded + corrected.** The 3-qubit or Shor circuit with `noisy=True`
+   and `correction="dynamic"` → post-QEC error rate.
+
+Both are compared per *logical state* (0/1 vs $+/-$ basis). Because $q_0$ is
+the **right-most** bit of the `out` register, `regs["out"][-1]` cleanly
+extracts the logical bit, independent of qubit count (1, 3, or 9).
+
+### 6.6 Session state
+
+The **Run simulation** button sets `st.session_state.show_results = True`.
+The **Reset** button clears it. This ensures that adjusting a slider after
+a run does not bounce the user back to the overview — a common Streamlit
+pitfall.
+
+---
+
+## 7. Mathematical Appendix
+
+### 7.1 Syndrome table derivation (3-qubit code)
+
+Let $q \in \{0,1\}^3$ be the encoded bit-string. Define parities
+
+$$
+s_0 = q_0 \oplus q_1, \qquad s_1 = q_1 \oplus q_2.
+$$
+
+Acting on $|000\rangle$ with a single $X_i$ gives:
+
+| Error | $q$ | $s_0$ | $s_1$ | Integer |
+|:-----:|:---:|:-----:|:-----:|:-------:|
+| $I$ | 000 | 0 | 0 | 0 |
+| $X_0$ | 100 | 1 | 0 | 1 |
+| $X_1$ | 010 | 1 | 1 | 3 |
+| $X_2$ | 001 | 0 | 1 | 2 |
+
+The mapping is a bijection from $\{q_0, q_1, q_2\}$ to
+$\{1, 2, 3\}$ — the syndrome *is* the qubit index.
+
+### 7.2 Shor code stabiliser group
+
+The stabiliser generators of the Shor code are:
+
+$$
+\begin{aligned}
+Z_0 Z_1,&\quad Z_1 Z_2 &&\text{(block 0 bit parity)}\\
+Z_3 Z_4,&\quad Z_4 Z_5 &&\text{(block 1 bit parity)}\\
+Z_6 Z_7,&\quad Z_7 Z_8 &&\text{(block 2 bit parity)}\\
+X_0 X_1 X_2 & X_3 X_4 X_5 &&\text{(phase parity block 0 vs 1)}\\
+X_3 X_4 X_5 & X_6 X_7 X_8 &&\text{(phase parity block 1 vs 2)}
+\end{aligned}
+$$
+
+These 8 operators commute and are independent, so the logical code space has
+dimension $2^{9-8} = 2$.
+
+### 7.3 Failure probabilities
+
+**3-qubit code.** A logical failure occurs for any $X$ error pattern in which
+$\geq 2$ qubits flip:
+
+$$
+P_L = \sum_{k=2}^{3} \binom{3}{k} p^k (1-p)^{3-k}
+= 3p^2(1-p) + p^3.
+$$
+
+**Shor code.** A logical failure occurs for any error pattern with $\geq 2$
+affected qubits (from any of the 8 stabilisers being violated):
+
+$$
+P_L^{\text{Shor}} \approx \binom{9}{2} p^2 = 36 p^2 + O(p^3).
+$$
+
+**Break-even.** The crossover $P_L(p) = p$ yields:
+
+- 3-qubit code: $p^\star \approx 1/3$;
+- Shor code: $p^\star \approx 1/36 \approx 2.8\%$.
+
+---
+
+## 8. Interpreting the Results
+
+The statistical table has these columns:
+
+| Column | Meaning |
+|--------|---------|
+| **Unprotected errors** | Absolute count of logical errors in the raw-qubit run. |
+| **Raw error rate (%)** | $100 \times \text{errors} / \text{shots}$. |
+| **Syndrome-flagged shots** | Runs in which the syndrome was non-zero. |
+| **Successfully corrected** | Flagged runs that decoded to the correct logical bit. |
+| **Remaining errors** | Runs that decoded to the wrong logical bit. |
+| **Post-QEC error rate (%)** | $100 \times \text{remaining} / \text{shots}$. |
+| **Correction success (%)** | $100 \times \text{corrected} / \text{detected}$. |
+
+Colour coding:
+
+- 🟩 **Green row** — post-QEC rate < raw rate. QEC helped.
+- 🟨 **Amber row** — post-QEC rate > raw rate. Physical error rate is above
+  threshold (for the Shor code, try $p \leq 2\%$ to see QEC win).
+- ⬜ **Grey row** — no change.
+
+If you see the Shor code make things *worse* at $p = 20\%$, that is not a
+bug — the code has 9 physical qubits exposed versus 1, and the $\sim 36p^2$
+term dominates at high $p$. This is the **threshold behaviour** that makes
+fault-tolerant quantum computing hard and is exactly the effect the demo
+wants to expose.
+
+---
+
+## 9. Limitations & Future Work
+
+- **Ideal gates.** Only the $id$ gates carry noise; the encoding, syndrome,
+  and decode gates are perfect. A fully fault-tolerant simulation would
+  also model gate errors.
+- **Ancilla noise.** The measurement ancillas are error-free; in a real
+  device they contribute to the syndrome.
+- **Single-round code.** Only one round of syndrome extraction is performed.
+  Real fault-tolerant schemes repeat extraction to handle measurement
+  errors.
+- **No surface code.** The Shor code is a pedagogical example; modern
+  hardware favours the surface code (higher threshold, nearest-neighbour
+  checks).
+- **No error modelling beyond Pauli.** Coherent and leakage errors are not
+  simulated (though the discretisation theorem makes Pauli noise a good
+  proxy for *depolarising* channels).
+
+Possible extensions:
+
+- Add a **Steane 7-qubit code** and a **surface code** demo.
+- Add a **fault-tolerant flag** that also injects noise on CNOTs and
+  measurements.
+- Add **correlated noise** channels (Kraus operators).
+- Add a **logical error rate curve** plot (error rate vs. $p$) to make the
+  threshold explicit.
+
+---
+
+## 10. Installation
+
+### Requirements
+
+```
+python >= 3.9
+qiskit >= 1.0
+qiskit-aer >= 0.14
+matplotlib >= 3.7
+pylatexenc >= 2.10
+numpy >= 1.24
+streamlit >= 1.30
+```
+
+### Install
+
+```bash
+pip install qiskit qiskit-aer matplotlib pylatexenc numpy streamlit
+```
+
+### Run
+
+```bash
+streamlit run qec_app.py
+```
+
+Then open <http://localhost:8501> in your browser.
+
+### Quick sanity check
+
+On launch, select **Ideal transmission** and click **Run simulation**. You
+should see a **100 %** success rate and no errors — confirming the simulator
+is set up correctly. Then try **Shor 9-qubit code** with $p = 2\%$ in the
+`Y` channel: the post-QEC error rate should be visibly lower than the raw
+error rate.
+
+---
+
+## 11. References
+
+1. P. W. Shor, *Scheme for reducing decoherence in quantum computer memory*,
+   Phys. Rev. A **52**, R2493 (1995).
+2. A. M. Steane, *Error correcting codes in quantum theory*,
+   Phys. Rev. Lett. **77**, 793 (1996).
+3. D. Gottesman, *Stabilizer Codes and Quantum Error Correction*, PhD
+   thesis, Caltech (1997). arXiv:quant-ph/9705052.
+4. M. A. Nielsen and I. L. Chuang, *Quantum Computation and Quantum
+   Information*, Cambridge University Press (2010), §10.
+5. J. Preskill, *Quantum Computing in the NISQ era and beyond*,
+   Quantum **2**, 79 (2018).
+6. Qiskit Aer documentation: <https://qiskit.github.io/qiskit-aer/>.
+
+---
+
+## 12. License
+
+Released under the **MIT License** — see [LICENSE](LICENSE) for details.
+
+<div align="center">
+
+**Built with Qiskit + Streamlit · No quantum hardware required**
+
+</div>
