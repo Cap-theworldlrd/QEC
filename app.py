@@ -185,6 +185,7 @@ def _layout_circuit(qc):
             meters[qc.find_bit(inst.clbits[0]).index] = d
         if name == "if_else":
             reg, value = op.condition
+            d["condition_register"] = getattr(reg, "name", None)
             body = op.blocks[0]
             b = body.data[0]
             d["gate"] = b.operation.name
@@ -200,7 +201,8 @@ def draw_textbook_circuit(qc, title, ghost=None, error_title="Error", highlight=
                           footnote=None, prep_label=None):
     """
     ghost     : (pauli, [wires]) -> dashed boxes for 'possible error' locations
-    highlight : syndrome value whose controlled correction is drawn as the one that fires
+    highlight : syndrome value, or {classical_register_name: value} for multi-register circuits,
+                whose controlled correction branches are highlighted as firing
     """
     from matplotlib.patches import Rectangle, Ellipse, Circle, Arc, FancyBboxPatch
 
@@ -233,7 +235,11 @@ def draw_textbook_circuit(qc, title, ghost=None, error_title="Error", highlight=
         reg, idx = bit_locations[0]
         ax.text(xmin - 1.05, -w, f"{reg.name}{idx}  |0⟩", ha="right", va="center", fontsize=11)
         if has_decoded_output and reg.name == "q":
-            ax.text(xmax + 1.05, -w, "|ψ⟩" if idx == 0 else "|0⟩", ha="left", va="center", fontsize=11)
+            # Use the concrete test state when known; reserve |psi> for an explicitly
+            # generic input (not what this app currently prepares by default).
+            output_state = prep_label if prep_label else "|ψ⟩"
+            ax.text(xmax + 1.05, -w, output_state if idx == 0 else "|0⟩",
+                    ha="left", va="center", fontsize=11)
 
     # gates
     for d in ops:
@@ -260,7 +266,10 @@ def draw_textbook_circuit(qc, title, ghost=None, error_title="Error", highlight=
             box(x, -wr[0], nm.upper())
         elif nm == "if_else":
             y = -d["target"]
-            sel = highlight is not None and d["value"] == highlight
+            if isinstance(highlight, dict):
+                sel = highlight.get(d.get("condition_register")) == d["value"]
+            else:
+                sel = highlight is not None and d["value"] == highlight
             box(x, y, d["gate"].upper(), fc="#2CA02C" if sel else "white",
                 ec="#146314" if sel else "black", ls="-" if sel else "--",
                 tc="white" if sel else "black")
@@ -527,7 +536,9 @@ def identify_shor_errors(syndromes):
             fixes.append(("x", 3 * k + SYNDROME_TO_INDEX[v]))
     v = syndromes.get("sz", 0)
     if v:
-        fixes.append(("z", SYNDROME_TO_INDEX[v]))
+        # The phase syndrome identifies a 3-qubit Shor block, not a specific
+        # qubit index. Apply Z to the representative at the start of that block.
+        fixes.append(("z", 3 * SYNDROME_TO_INDEX[v]))
     return fixes
 
 
@@ -772,7 +783,7 @@ def walkthrough_comparison_table(code, inject, found, bases, n_bits):
     expected = "0" * (n_bits - 1) + "1"
     rows = []
     for basis in bases:
-        for label, corr in [("Without correction", "none"), ("With correction", "fixed")]:
+        for label, corr in [("Without correction", "none"), ("With syndrome-controlled correction", "dynamic")]:
             if code == "shor":
                 qc = build_shor_circuit(basis, inject, correction=corr, fixed=found)
             else:
@@ -811,7 +822,13 @@ if not st.session_state.show_results:
         - **Y-error demonstration:** shows the limitation of the bit-flip repetition code
           (it corrects the X part of Y but not the Z part).
         - **Shor 9-qubit code:** combines bit-flip and phase-flip protection to correct
-          arbitrary single-qubit Pauli errors.
+          arbitrary single-qubit Pauli errors under the idealized circuit model.
+
+        **Important scope note:** the walkthrough prepares test states such as |1> and |−>;
+        it does not yet provide a generic unknown input |ψ> as in some textbook diagrams.
+        `q0` is the physical wire name, while `|ψ>` denotes a state carried by a wire.
+        The q# selector injects a test fault only. The correction is chosen from measured
+        syndrome bits, not directly from that selector.
 
         The deterministic walkthrough shows one selected physical error. The statistical
         experiment uses a Qiskit Aer `NoiseModel` attached to data-qubit `id` gates. This
@@ -826,6 +843,11 @@ else:
         f"Running {shots:,} shots per statistical test with a physical error probability "
         f"of {error_pct}%."
     )
+    st.caption(
+        "This is a syndrome-decoding demonstration, not a machine-learning predictor. "
+        "The selected qubit sets the injected teaching fault; the measured syndrome is "
+        "what determines the correction."
+    )
 
     try:
         with st.spinner("Building circuits and running Qiskit Aer simulations..."):
@@ -834,7 +856,7 @@ else:
             # ------------------------------------------------------------
             if demo == "Ideal transmission":
                 qc = build_unprotected("Z", noisy=False)
-                show_circuit(qc, "Ideal transmission — no noise")
+                show_circuit(qc, "Ideal transmission — no noise", prep_label="|1⟩")
 
                 counts = run_circuit(qc, IDEAL_SHOTS)
                 ok = counts.get("1", 0)
@@ -898,6 +920,10 @@ else:
                 st.subheader("Measured syndrome")
                 st.metric("Syndrome (s₀ s₁)", f"{s0}{s1}")
                 st.write("Syndrome table: `00 → no error`, `10 → q0`, `11 → q1`, `01 → q2`.")
+                st.caption(
+                    "The selected q# is used only to inject the demonstration fault. "
+                    "The correction circuit uses the measured syndrome bits to choose its gate."
+                )
 
                 if found is not None:
                     correction_gate = "X" if code == "bitflip" else "Z"
@@ -975,12 +1001,21 @@ else:
                 else:
                     st.info("No correctable single-qubit error was detected.")
 
-                after = build_shor_circuit("X", inject, correction="fixed", fixed=fixes)
+                # Important: this second circuit performs syndrome measurement and then
+                # chooses corrections from its own fresh syndrome bits. It does not receive
+                # the selected error_qubit or the pre-run `fixes` list as correction input.
+                after = build_shor_circuit("X", inject, correction="dynamic")
                 show_circuit(
                     after,
-                    "Shor code after correction, decoding and measurement",
+                    "Shor code with syndrome-controlled correction, decoding and measurement",
                     error_title=ERROR_TITLES[walk_type],
+                    highlight=syndromes,
                     prep_label="|-⟩",
+                )
+                st.caption(
+                    "The green conditional correction branches correspond to the syndrome "
+                    "measured in the separate walkthrough above. The displayed full circuit "
+                    "re-measures its own syndrome and controls correction from those fresh bits."
                 )
 
                 walkthrough_comparison_table("shor", inject, fixes, ["Z", "X"], 9)
