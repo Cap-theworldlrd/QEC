@@ -12,10 +12,10 @@ Requirements:
     pip install qiskit qiskit-aer matplotlib pylatexenc numpy streamlit
 
 Run:
-    streamlit run qec_app.py
+    streamlit run qec_app_final.py
 
-Noise is simulated inside the quantum circuit using a Qiskit NoiseModel
-attached to identity gates; measurement outcomes are never altered manually.
+Statistical noise is simulated inside the circuit on data-qubit identity gates.
+Other operations/readout are ideal in this teaching model; counts are not altered manually.
 """
 
 from collections import Counter
@@ -105,9 +105,19 @@ def parse_key(qc, key):
 
 
 def extract_syndrome(qc, shots=CHECK_SHOTS):
-    """Run a syndrome circuit and return {register: integer}."""
+    """Run a deterministic, no-noise walkthrough and return {register: integer}.
+
+    Because the walkthrough inserts one explicit Pauli error and otherwise uses
+    ideal operations, the syndrome should be identical on every shot. Refuse to
+    silently pick a majority syndrome if that invariant is violated.
+    """
     counts = run_circuit(qc, shots)
-    key = max(counts, key=counts.get)
+    if len(counts) != 1:
+        raise RuntimeError(
+            "Expected a deterministic syndrome in the walkthrough, but simulator "
+            f"returned multiple outcomes: {counts}"
+        )
+    key = next(iter(counts))
     regs = parse_key(qc, key)
     return {n: int(v, 2) for n, v in regs.items() if n != "out"}
 
@@ -126,12 +136,16 @@ def out_strings(qc, counts):
 # that is simulated, so the diagram always matches what runs.
 # ============================================================================
 _GROUP_STYLE = {
-    "ENCODE": ("Encode", "#2E8B57"), "DECODE": ("Decode", "#2E8B57"),
-    "ERROR": (None, "#D62728"), "CORRECT": ("Correct Error", "#1F5FBF"),
-    "MEASURE": ("Measure", "#7B4FA3"),
+    "ENCODE": ("Encode", "#2E8B57"),
+    "DECODE": ("Decode", "#2E8B57"),
+    "ERROR": (None, "#D62728"),
+    "SYNDROME": ("Syndrome Measurement", "#7B4FA3"),
+    "CORRECT": ("Correct Error", "#1F5FBF"),
+    "MEASURE": ("Final Measurement", "#555555"),
 }
 _GROUP_OF = {
-    "SYNDROME": "CORRECT", "X-SYNDROME": "CORRECT", "Z-SYNDROME": "CORRECT",
+    # Extracting a syndrome is not itself applying a correction.
+    "SYNDROME": "SYNDROME", "X-SYNDROME": "SYNDROME", "Z-SYNDROME": "SYNDROME",
     "CORRECT": "CORRECT", "ENCODE": "ENCODE", "DECODE": "DECODE",
     "ERROR": "ERROR", "MEASURE": "MEASURE",
 }
@@ -207,12 +221,18 @@ def draw_textbook_circuit(qc, title, ghost=None, error_title="Error", highlight=
         ax.add_patch(Rectangle((x - w / 2, y - w / 2), w, w, fc=fc, ec=ec, ls=ls, lw=1.7, zorder=3))
         ax.text(x, y, txt, ha="center", va="center", fontsize=13, color=tc, zorder=4)
 
-    # wires and labels
+    # Wires and initial-state labels. Only show |psi>, |0>, ... at the right
+    # when this circuit actually contains the decode/final-output stage. A
+    # syndrome-only circuit is still encoded and must not be labelled as decoded.
+    has_decoded_output = any(cr.name == "out" for cr in qc.cregs) and any(
+        section["name"] == "DECODE" and section["ops"] for section in sections
+    )
     for w in range(n):
         ax.plot([xmin - 0.9, xmax + 0.9], [-w, -w], color="black", lw=1.2, zorder=1)
-        reg, idx = qc.find_bit(qc.qubits[w]).registers[0]
+        bit_locations = qc.find_bit(qc.qubits[w]).registers
+        reg, idx = bit_locations[0]
         ax.text(xmin - 1.05, -w, f"{reg.name}{idx}  |0⟩", ha="right", va="center", fontsize=11)
-        if reg.name == "q":
+        if has_decoded_output and reg.name == "q":
             ax.text(xmax + 1.05, -w, "|ψ⟩" if idx == 0 else "|0⟩", ha="left", va="center", fontsize=11)
 
     # gates
@@ -338,9 +358,11 @@ def _footnote(code, pauli=None):
         return ("Y = iXZ: the bit-flip code corrects only the X part. The Z part is NOT detected, "
                 "so a phase error remains after this correction.")
     if code == "phaseflip":
-        return ("Each ancilla (H, controlled-X, H) compares the phase of two neighbouring qubits; "
-                "a Z error flips it. The syndrome (s0 s1) selects which controlled Z fires.")
-    return ("Dashed boxes = possible error spots. The syndrome (s0 s1) selects which controlled X fires.")
+        return ("Each ancilla (H, controlled-X, H) measures a neighbouring X_i X_j parity; "
+                "a Z error flips the result. The syndrome (s0 s1) selects the classically "
+                "controlled Z correction.")
+    return ("Dashed boxes mark possible error locations. The syndrome (s0 s1) selects the "
+            "classically controlled X correction.")
 
 
 # ============================================================================
@@ -619,8 +641,9 @@ st.set_page_config(
 st.title("⚛️ Quantum Error Correction Lab")
 st.caption(
     "Interactive Qiskit/Aer simulation of three-qubit repetition codes, the Y-error "
-    "limitation, and the Shor 9-qubit code. All noise is injected inside the quantum "
-    "circuit via a Qiskit NoiseModel — measurement outcomes are never altered manually."
+    "limitation, and the Shor 9-qubit code. Statistical runs model independent Pauli "
+    "errors on data-qubit identity gates only; other operations and readout are ideal. "
+    "Measurement outcomes are never edited manually."
 )
 
 
@@ -628,56 +651,62 @@ st.caption(
 with st.sidebar:
     st.header("Simulation settings")
 
-    demo = st.selectbox(
-        "Demonstration",
-        [
-            "Ideal transmission",
-            "3-qubit bit-flip code (X)",
-            "3-qubit phase-flip code (Z)",
-            "Y error — 3-qubit limitation",
-            "Shor 9-qubit code",
-        ],
-    )
-
-    error_pct = st.slider(
-        "Physical error probability (%)",
-        min_value=1, max_value=50, value=5,
-        help="Used only for the statistical noisy simulation. The walkthrough error is deterministic.",
-    )
-
-    shots = st.select_slider(
-        "Shots per statistical test",
-        options=[100, 250, 500, 1000, 2000, 5000],
-        value=2000,
-    )
-
-    max_qubit = 8 if demo == "Shor 9-qubit code" else 2
-    error_qubit = st.number_input(
-        "Qubit receiving the walkthrough error",
-        min_value=0, max_value=max_qubit, value=0, step=1,
-        help=f"Choose q0–q{max_qubit} for the deterministic single-error walkthrough.",
-    )
-
-    shor_noise = "Y"
-    if demo == "Shor 9-qubit code":
-        shor_noise = st.selectbox(
-            "Shor-code noise channel",
-            ["X", "Z", "Y", "G"], index=2,
-            format_func=lambda x: {
-                "X": "X (bit flip)",
-                "Z": "Z (phase flip)",
-                "Y": "Y (combined X + Z)",
-                "G": "General random X/Y/Z",
-            }[x],
+    with st.form("simulation_settings"):
+        demo = st.selectbox(
+            "Demonstration",
+            [
+                "Ideal transmission",
+                "3-qubit bit-flip code (X)",
+                "3-qubit phase-flip code (Z)",
+                "Y error — 3-qubit limitation",
+                "Shor 9-qubit code",
+            ],
         )
 
+        error_pct = st.slider(
+            "Physical error probability (%)",
+            min_value=1, max_value=50, value=5,
+            help="Used only for the statistical noisy simulation. The walkthrough error is deterministic.",
+        )
+
+        shots = st.select_slider(
+            "Shots per statistical test",
+            options=[100, 250, 500, 1000, 2000, 5000],
+            value=2000,
+        )
+
+        max_qubit = 8 if demo == "Shor 9-qubit code" else 2
+        error_qubit = st.number_input(
+            "Qubit receiving the walkthrough error",
+            min_value=0, max_value=max_qubit, value=0, step=1,
+            help=f"Choose q0–q{max_qubit} for the deterministic single-error walkthrough.",
+        )
+
+        shor_noise = "Y"
+        if demo == "Shor 9-qubit code":
+            shor_noise = st.selectbox(
+                "Shor-code noise channel",
+                ["X", "Z", "Y", "G"], index=2,
+                format_func=lambda x: {
+                    "X": "X (bit flip)",
+                    "Z": "Z (phase flip)",
+                    "Y": "Y (combined X + Z)",
+                    "G": "General random X/Y/Z",
+                }[x],
+            )
+
+        run_button = st.form_submit_button("Run simulation", type="primary", use_container_width=True)
+
+    # If a previously selected Shor q8 is retained while switching to a 3-qubit
+    # demo, clamp it to a valid data-qubit index before building the circuit.
+    error_qubit = max(0, min(int(error_qubit), max_qubit))
+
     st.divider()
-    run_button = st.button("Run simulation", type="primary", use_container_width=True)
-    if st.button("Reset", use_container_width=True):
-        st.session_state.pop("show_results", None)
+    if st.button("Back to overview", use_container_width=True):
+        st.session_state["show_results"] = False
         st.rerun()
 
-# Persist the "results shown" state so slider changes do not jump back to overview
+# The sidebar form submits settings only when Run simulation is clicked.
 if "show_results" not in st.session_state:
     st.session_state.show_results = False
 if run_button:
@@ -707,35 +736,35 @@ def show_statistics(res, title):
     for t in res["tests"]:
         raw_rate = 100 * t["raw_errors"] / res["shots"]
         post_rate = 100 * t["remaining"] / res["shots"]
-        success = 100 * t["corrected"] / t["detected"] if t["detected"] else 0.0
+        success = (100 * t["corrected"] / t["detected"]) if t["detected"] else None
         rows.append({
             "Test": t["label"],
-            "Unprotected errors": t["raw_errors"],
-            "Raw error rate (%)": round(raw_rate, 2),
+            "Unprotected logical readout errors": t["raw_errors"],
+            "Unprotected readout error rate (%)": round(raw_rate, 2),
             "Syndrome-flagged shots": t["detected"],
-            "Successfully corrected": t["corrected"],
-            "Remaining errors": t["remaining"],
-            "Post-QEC error rate (%)": round(post_rate, 2),
-            "Correction success (%)": round(success, 2),
+            "Flagged shots with correct logical readout": t["corrected"],
+            "Logical readout errors after QEC": t["remaining"],
+            "Post-QEC logical readout error rate (%)": round(post_rate, 2),
+            "Correct readout among flagged shots (%)": round(success, 2) if success is not None else "N/A",
         })
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
     for row in rows:
-        raw = row["Raw error rate (%)"]
-        post = row["Post-QEC error rate (%)"]
+        raw = row["Unprotected readout error rate (%)"]
+        post = row["Post-QEC logical readout error rate (%)"]
         if post < raw:
             st.success(
-                f'{row["Test"]}: QEC reduced the measured error rate from '
+                f'{row["Test"]}: the measured logical-readout error rate fell from '
                 f"{raw:.2f}% to {post:.2f}%."
             )
         elif post > raw:
             st.warning(
-                f'{row["Test"]}: QEC increased the measured error rate from '
-                f"{raw:.2f}% to {post:.2f}%. At this physical error rate, the extra "
-                "exposed qubits can outweigh the protection."
+                f'{row["Test"]}: the measured logical-readout error rate rose from '
+                f"{raw:.2f}% to {post:.2f}%. At this physical error rate, multiple "
+                "errors or the simplified noise model may outweigh the protection."
             )
         else:
-            st.info(f'{row["Test"]}: no measured change in error rate.')
+            st.info(f'{row["Test"]}: no measured change in logical-readout error rate.')
 
 
 def walkthrough_comparison_table(code, inject, found, bases, n_bits):
@@ -751,11 +780,11 @@ def walkthrough_comparison_table(code, inject, found, bases, n_bits):
             counts = out_strings(qc, run_circuit(qc, CHECK_SHOTS))
             bits, n = counts.most_common(1)[0]
             if bits == expected:
-                verdict = "Logical state restored"
+                verdict = "Decoded output matches expected bitstring"
             elif bits[-1] == "1":
-                verdict = "Logical bit OK, other qubits corrupted"
+                verdict = "Logical readout correct; other qubits differ"
             else:
-                verdict = "Logical error"
+                verdict = "Logical readout differs from expected value"
             rows.append({
                 "Basis": "0/1" if basis == "Z" else "+/-",
                 "Mode": label,
@@ -785,9 +814,10 @@ if not st.session_state.show_results:
           arbitrary single-qubit Pauli errors.
 
         The deterministic walkthrough shows one selected physical error. The statistical
-        experiment uses a Qiskit Aer `NoiseModel` attached to the circuit's `id` gates, so
-        the errors are introduced inside the quantum simulation rather than by editing
-        measurement results.
+        experiment uses a Qiskit Aer `NoiseModel` attached to data-qubit `id` gates. This
+        is a deliberately simplified data-only Pauli-noise model: encoding, syndrome
+        extraction, correction, ancillas and measurement readout are ideal. Errors are
+        introduced inside the simulator rather than by editing measurement results.
         """
     )
 else:
@@ -835,9 +865,11 @@ else:
                     tests = [("Logical |1>, 0/1 basis", "Z", "Z")]
                     compare_bases = ["Z"]
                 elif demo == "3-qubit phase-flip code (Z)":
-                    code, pauli, basis = "phaseflip", "Z", "Z"
-                    tests = [("Protected logical |1> vs unprotected |->", "Z", "X")]
-                    compare_bases = ["Z"]
+                    # Match the protected and unprotected input/readout bases.
+                    # A Z error is visible on |-> measured in the +/- basis.
+                    code, pauli, basis = "phaseflip", "Z", "X"
+                    tests = [("Logical |−>, +/- basis", "X", "X")]
+                    compare_bases = ["X"]
                 else:
                     code, pauli, basis = "bitflip", "Y", "X"
                     tests = [
